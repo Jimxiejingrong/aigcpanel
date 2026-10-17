@@ -1,0 +1,371 @@
+name: Build AIGCPanel Custom Pro (Windows EXE)
+
+on:
+  workflow_dispatch: # 允许你在 GitHub 网页上点击按钮手动触发编译
+
+jobs:
+  build-win-pro:
+    runs-on: windows-latest
+    steps:
+      - name: 1. 拉取源码
+        uses: actions/checkout@v4
+
+      - name: 2. 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+
+      - name: 3. 自动注入【可视化工作流】与【智能直播】高级功能与控制台
+        shell: node {0}
+        run: |
+          const fs = require('fs');
+          const path = require('path');
+
+          console.log('=== [1/3] 正在向 Electron 主进程注入工作流与直播监控引擎 ===');
+          const mainInjectCode = `
+          // === CUSTOM PRO ENGINE INJECTED ===
+          try {
+            const { ipcMain, BrowserWindow } = require('electron');
+            const vm = require('node:vm');
+            const fs = require('node:fs');
+            const { exec } = require('node:child_process');
+            const { promisify } = require('node:util');
+            const execAsync = promisify(exec);
+            let liveWin = null;
+            const BANNED_REGEX = /(最便宜|国家级|第一|极致|顶级|加微信|加V|VX|死|滚|诈骗)/gi;
+
+            // 1. 可视化工作流引擎（支持断点续跑、JS沙箱、LLM、CLI调用）
+            ipcMain.handle('custom:workflow:run', async (_, { nodes, edges, cache = {} }) => {
+              const context = { ...cache };
+              const inDegree = {};
+              const adj = {};
+              nodes.forEach(n => { inDegree[n.id] = 0; adj[n.id] = []; });
+              edges.forEach(e => {
+                if (adj[e.source]) adj[e.source].push(e.target);
+                inDegree[e.target] = (inDegree[e.target] || 0) + 1;
+              });
+              const queue = nodes.filter(n => inDegree[n.id] === 0).map(n => n.id);
+
+              const unlock = (id) => {
+                for (const next of (adj[id] || [])) {
+                  inDegree[next]--;
+                  if (inDegree[next] === 0) queue.push(next);
+                }
+              };
+
+              while (queue.length > 0) {
+                const currentId = queue.shift();
+                const node = nodes.find(n => n.id === currentId);
+                if (!node) continue;
+
+                // 断点续跑核心校验：若该节点之前成功且本地文件存在，直接跳过
+                if (context[currentId]?.status === 'SUCCESS') {
+                  const outFile = context[currentId]?.outputFile;
+                  if (!outFile || fs.existsSync(outFile)) {
+                    unlock(currentId);
+                    continue;
+                  }
+                }
+
+                try {
+                  const rawStr = JSON.stringify(node.data || {});
+                  const parsedStr = rawStr.replace(/\\{\\{([\\w_-]+)\\.([\\w_-]+)\\}\\}/g, (_, nId, k) => {
+                    return String(context[nId]?.[k] ?? '').replace(/"/g, '\\\\\\"');
+                  });
+                  const data = JSON.parse(parsedStr);
+                  let res = {};
+
+                  if (node.type === 'js_script') {
+                    const sandbox = { inputs: data, output: null, Math, Date };
+                    vm.createContext(sandbox);
+                    vm.runInContext(data.code || 'output = inputs', sandbox, { timeout: 5000 });
+                    res = { output: sandbox.output };
+                  } else if (node.type === 'llm') {
+                    const resp = await fetch((data.baseUrl || 'https://api.deepseek.com') + '/v1/chat/completions', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + data.apiKey },
+                      body: JSON.stringify({ model: data.model || 'deepseek-chat', messages: [{ role: 'user', content: data.prompt }] })
+                    }).then(r => r.json());
+                    res = { output: resp.choices?.[0]?.message?.content || '' };
+                  } else if (node.type === 'aigc_cli') {
+                    const { stdout } = await execAsync('aigcpanel ' + data.command);
+                    res = { output: stdout.trim() };
+                  } else if (node.type === 'regex') {
+                    const match = String(data.source || '').match(new RegExp(data.pattern || '.*'));
+                    res = { output: match ? match[0] : '' };
+                  } else {
+                    res = { output: data.value || 'done' };
+                  }
+
+                  context[currentId] = { status: 'SUCCESS', ...res, time: new Date().toLocaleTimeString() };
+                  unlock(currentId);
+                } catch (err) {
+                  context[currentId] = { status: 'FAILED', error: err.message };
+                  return { success: false, context, failedNode: currentId, error: err.message };
+                }
+              }
+              return { success: true, context };
+            });
+
+            // 2. 智能直播弹幕监控与自动回复引擎
+            ipcMain.handle('custom:live:start', async (event, { url, qaList, llmConfig }) => {
+              if (liveWin && !liveWin.isDestroyed()) liveWin.close();
+              liveWin = new BrowserWindow({ width: 1280, height: 800, show: false, webPreferences: { contextIsolation: true } });
+              await liveWin.loadURL(url);
+              liveWin.webContents.executeJavaScript(`
+                const seen = new Set();
+                new MutationObserver(() => {
+                  document.querySelectorAll('[class*="chat"], [class*="danmu"], [class*="comment"], .webcast-chatroom___item').forEach(el => {
+                    const t = (el.innerText || '').trim().replace(/\\\\n+/g, ': ');
+                    if (t && !seen.has(t) && t.length < 120) {
+                      seen.add(t);
+                      if (seen.size > 600) seen.clear();
+                      console.log('__LIVE_DM__:' + t);
+                    }
+                  });
+                }).observe(document.body, { childList: true, subtree: true });
+              `);
+              liveWin.webContents.on('console-message', async (_, __, msg) => {
+                if (!msg.startsWith('__LIVE_DM__:')) return;
+                const raw = msg.replace('__LIVE_DM__:', '');
+                if (BANNED_REGEX.test(raw)) {
+                  event.sender.send('custom:live:msg', { type: 'BLOCKED', raw, reply: '触发违禁词已自动拦截', time: new Date().toLocaleTimeString() });
+                  return;
+                }
+                let reply = '';
+                for (const qa of (qaList || [])) {
+                  if (qa.keyword && raw.includes(qa.keyword)) { reply = qa.answer; break; }
+                }
+                if (!reply && llmConfig?.apiKey) {
+                  try {
+                    const r = await fetch((llmConfig.baseUrl || 'https://api.deepseek.com') + '/v1/chat/completions', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + llmConfig.apiKey },
+                      body: JSON.stringify({
+                        model: llmConfig.model || 'deepseek-chat',
+                        messages: [
+                          { role: 'system', content: llmConfig.prompt || '你是直播间助播，简短口语回答观众弹幕，40字以内，严禁极限词。' },
+                          { role: 'user', content: raw }
+                        ]
+                      })
+                    }).then(res => res.json());
+                    reply = (r.choices?.[0]?.message?.content || '').replace(BANNED_REGEX, '**');
+                  } catch (e) {}
+                }
+                event.sender.send('custom:live:msg', { type: 'OK', raw, reply, time: new Date().toLocaleTimeString() });
+              });
+              return { ok: true };
+            });
+
+            ipcMain.handle('custom:live:stop', () => {
+              if (liveWin && !liveWin.isDestroyed()) liveWin.close();
+              liveWin = null;
+              return { ok: true };
+            });
+          } catch (e) { console.error('Pro inject err:', e); }
+          `;
+
+          // 自动寻找 Electron 主进程文件并追加
+          const findFiles = (dir, ext, list = []) => {
+            if (!fs.existsSync(dir)) return list;
+            for (const f of fs.readdirSync(dir)) {
+              const p = path.join(dir, f);
+              if (fs.statSync(p).isDirectory() && f !== 'node_modules' && f !== '.git') findFiles(p, ext, list);
+              else if (p.endsWith(ext)) list.push(p);
+            }
+            return list;
+          };
+
+          const tsFiles = findFiles('electron', '.ts');
+          const mainEntry = tsFiles.find(f => f.includes('index.ts') || f.includes('main.ts')) || tsFiles[0];
+          if (mainEntry) {
+            fs.appendFileSync(mainEntry, '\n' + mainInjectCode, 'utf-8');
+            console.log('✅ 已成功注入主进程:', mainEntry);
+          }
+
+          console.log('=== [2/3] 正在注入前端【Pro工作流 & 智能直播控制台】悬浮面板 ===');
+          const uiPanelScript = `
+          <script>
+          window.addEventListener('DOMContentLoaded', () => {
+            const btn = document.createElement('div');
+            btn.innerHTML = '⚡ PRO工作流 / 智能直播';
+            btn.style.cssText = 'position:fixed;bottom:18px;left:18px;z-index:99999;background:linear-gradient(135deg,#6366f1,#ec4899);color:#fff;padding:10px 18px;border-radius:30px;font-weight:bold;font-size:13px;cursor:pointer;box-shadow:0 4px 15px rgba(99,102,241,0.4);user-select:none;';
+            document.body.appendChild(btn);
+
+            const modal = document.createElement('div');
+            modal.style.cssText = 'display:none;position:fixed;inset:40px;z-index:99998;background:#1e1e2e;color:#cdd6f4;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.6);flex-direction:column;overflow:hidden;font-family:sans-serif;border:1px solid #313244;';
+            modal.innerHTML = \`
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 20px;background:#181825;border-bottom:1px solid #313244;">
+                <div style="display:flex;gap:12px;align-items:center;">
+                  <span style="font-size:16px;font-weight:bold;color:#fff;">🚀 自研开源增强中心 (免VIP解锁版)</span>
+                  <button id="tab-wf" style="background:#6366f1;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;">可视化工作流 (断点续跑)</button>
+                  <button id="tab-live" style="background:#313244;color:#cdd6f4;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;">智能直播 (多平台弹幕监控)</button>
+                </div>
+                <button id="close-pro" style="background:#f38ba8;color:#11111b;border:none;padding:6px 12px;border-radius:6px;font-weight:bold;cursor:pointer;">关闭 ✕</button>
+              </div>
+
+              <!-- 工作流视图 -->
+              <div id="view-wf" style="display:flex;flex:1;overflow:hidden;">
+                <div style="width:240px;background:#181825;padding:15px;border-right:1px solid #313244;display:flex;flex-direction:column;gap:10px;">
+                  <div style="font-size:12px;color:#a6adc8;">添加流水线节点：</div>
+                  <button class="add-node" data-type="llm" style="background:#313244;color:#fff;border:1px solid #45475a;padding:8px;border-radius:6px;cursor:pointer;text-align:left;">🤖 大模型 (LLM)</button>
+                  <button class="add-node" data-type="js_script" style="background:#313244;color:#fff;border:1px solid #45475a;padding:8px;border-radius:6px;cursor:pointer;text-align:left;">📜 JS 脚本沙箱</button>
+                  <button class="add-node" data-type="regex" style="background:#313244;color:#fff;border:1px solid #45475a;padding:8px;border-radius:6px;cursor:pointer;text-align:left;">🔍 正则提取</button>
+                  <button class="add-node" data-type="aigc_cli" style="background:#313244;color:#fff;border:1px solid #45475a;padding:8px;border-radius:6px;cursor:pointer;text-align:left;">🎬 数字人/TTS调用</button>
+                  <hr style="border-color:#313244;width:100%;"/>
+                  <button id="run-wf" style="background:#a6e3a1;color:#11111b;border:none;padding:10px;border-radius:6px;font-weight:bold;cursor:pointer;">▶ 运行工作流</button>
+                  <button id="resume-wf" style="background:#f9e2af;color:#11111b;border:none;padding:10px;border-radius:6px;font-weight:bold;cursor:pointer;">⏯ 断点续跑 (跳过成功)</button>
+                </div>
+                <div style="flex:1;padding:15px;overflow-y:auto;display:flex;flex-direction:column;gap:12px;" id="wf-canvas"></div>
+                <div style="width:320px;background:#11111b;padding:15px;border-left:1px solid #313244;overflow-y:auto;">
+                  <div style="font-weight:bold;margin-bottom:8px;">📊 节点运行状态与历史</div>
+                  <pre id="wf-log" style="font-size:12px;color:#a6e3a1;white-space:pre-wrap;"></pre>
+                </div>
+              </div>
+
+              <!-- 智能直播视图 -->
+              <div id="view-live" style="display:none;flex:1;padding:20px;gap:20px;overflow:hidden;">
+                <div style="width:380px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;">
+                  <label style="font-size:13px;">📺 直播间网页地址 (抖音/快手/B站/虎牙等)：</label>
+                  <input id="live-url" placeholder="https://live.douyin.com/xxxx" style="padding:8px;border-radius:6px;border:1px solid #45475a;background:#181825;color:#fff;"/>
+                  <label style="font-size:13px;">📚 知识库问答 (格式：关键词=回复)：</label>
+                  <textarea id="live-qa" rows="4" style="padding:8px;border-radius:6px;border:1px solid #45475a;background:#181825;color:#fff;">多少钱=宝宝咱们一号链接专享价只要99元！\n发货=48小时内顺丰包邮发出！</textarea>
+                  <label style="font-size:13px;">🔑 兜底大模型 API Key (DeepSeek/OpenAI)：</label>
+                  <input id="live-key" type="password" placeholder="sk-..." style="padding:8px;border-radius:6px;border:1px solid #45475a;background:#181825;color:#fff;"/>
+                  <label style="font-size:13px;">🎭 主播人设 Prompt & 违禁词拦截：</label>
+                  <textarea id="live-prompt" rows="3" style="padding:8px;border-radius:6px;border:1px solid #45475a;background:#181825;color:#fff;">你是热情助播，口语回复弹幕，35字以内，严禁极限词。</textarea>
+                  <div style="display:flex;gap:10px;">
+                    <button id="btn-live-start" style="flex:1;background:#a6e3a1;color:#11111b;border:none;padding:10px;border-radius:6px;font-weight:bold;cursor:pointer;">🟢 启动弹幕监控</button>
+                    <button id="btn-live-stop" style="background:#f38ba8;color:#11111b;border:none;padding:10px;border-radius:6px;font-weight:bold;cursor:pointer;">⏹ 停止</button>
+                  </div>
+                </div>
+                <div style="flex:1;background:#11111b;border-radius:8px;padding:15px;overflow-y:auto;border:1px solid #313244;">
+                  <div style="font-weight:bold;margin-bottom:10px;">💬 实时弹幕互动记录 (含DFA违禁词自动拦截)</div>
+                  <div id="live-logs" style="display:flex;flex-direction:column;gap:8px;font-size:13px;"></div>
+                </div>
+              </div>
+            \`;
+            document.body.appendChild(modal);
+
+            btn.onclick = () => { modal.style.display = modal.style.display === 'none' ? 'flex' : 'none'; };
+            modal.querySelector('#close-pro').onclick = () => { modal.style.display = 'none'; };
+            modal.querySelector('#tab-wf').onclick = () => {
+              modal.querySelector('#view-wf').style.display = 'flex';
+              modal.querySelector('#view-live').style.display = 'none';
+            };
+            modal.querySelector('#tab-live').onclick = () => {
+              modal.querySelector('#view-wf').style.display = 'none';
+              modal.querySelector('#view-live').style.display = 'flex';
+            };
+
+            let wfNodes = [
+              { id: 'node_1', type: 'llm', data: { baseUrl: 'https://api.deepseek.com', apiKey: '', model: 'deepseek-chat', prompt: '写一段30字的数字人带货口播' } },
+              { id: 'node_2', type: 'js_script', data: { code: 'output = "【处理后】：" + (inputs.text || "")', text: '{{node_1.output}}' } }
+            ];
+            let wfCache = {};
+
+            const renderNodes = () => {
+              const canvas = modal.querySelector('#wf-canvas');
+              canvas.innerHTML = '';
+              wfNodes.forEach((n, idx) => {
+                const card = document.createElement('div');
+                card.style.cssText = 'background:#181825;border:1px solid #45475a;border-radius:8px;padding:12px;';
+                card.innerHTML = \`
+                  <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                    <strong>#\${idx + 1} \${n.id} [\${n.type}]</strong>
+                    <span style="font-size:12px;color:\${wfCache[n.id]?.status === 'SUCCESS' ? '#a6e3a1' : '#f9e2af'}">\${wfCache[n.id]?.status || 'PENDING'}</span>
+                  </div>
+                  <textarea data-idx="\${idx}" rows="3" style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:4px;padding:6px;font-family:monospace;font-size:12px;">\${JSON.stringify(n.data, null, 2)}</textarea>
+                \`;
+                card.querySelector('textarea').onchange = (e) => {
+                  try { wfNodes[idx].data = JSON.parse(e.target.value); } catch (err) { alert('JSON格式错误'); }
+                };
+                canvas.appendChild(card);
+              });
+            };
+            renderNodes();
+
+            modal.querySelectorAll('.add-node').forEach(b => {
+              b.onclick = () => {
+                const type = b.getAttribute('data-type');
+                const id = 'node_' + (wfNodes.length + 1);
+                const templates = {
+                  llm: { baseUrl: 'https://api.deepseek.com', apiKey: '', model: 'deepseek-chat', prompt: '处理：{{node_1.output}}' },
+                  js_script: { code: 'output = inputs.val + " 经过修改"', val: '{{node_1.output}}' },
+                  regex: { source: '{{node_1.output}}', pattern: '[0-9]+' },
+                  aigc_cli: { command: 'serverCall --server CosyVoice --function tts --param "{\\"text\\":\\"{{node_1.output}}\\"}"' }
+                };
+                wfNodes.push({ id, type, data: templates[type] || {} });
+                renderNodes();
+              };
+            });
+
+            const execWorkflow = async (useCache) => {
+              if (!useCache) wfCache = {};
+              const edges = wfNodes.slice(0, -1).map((n, i) => ({ source: n.id, target: wfNodes[i + 1].id }));
+              modal.querySelector('#wf-log').textContent = '⏳ 执行中...';
+              const ipc = window.electron?.ipcRenderer || window.ipcRenderer;
+              if (ipc) {
+                const res = await ipc.invoke('custom:workflow:run', { nodes: wfNodes, edges, cache: wfCache });
+                wfCache = res.context || {};
+                renderNodes();
+                modal.querySelector('#wf-log').textContent = JSON.stringify(res, null, 2);
+              }
+            };
+
+            modal.querySelector('#run-wf').onclick = () => execWorkflow(false);
+            modal.querySelector('#resume-wf').onclick = () => execWorkflow(true);
+
+            modal.querySelector('#btn-live-start').onclick = async () => {
+              const url = modal.querySelector('#live-url').value.trim();
+              if (!url) return alert('请输入直播间地址');
+              const qaList = modal.querySelector('#live-qa').value.split('\\n').map(l => {
+                const [k, v] = l.split('=');
+                return { keyword: (k||'').trim(), answer: (v||'').trim() };
+              }).filter(i => i.keyword);
+              const llmConfig = {
+                apiKey: modal.querySelector('#live-key').value.trim(),
+                prompt: modal.querySelector('#live-prompt').value.trim()
+              };
+              const ipc = window.electron?.ipcRenderer || window.ipcRenderer;
+              if (ipc) {
+                await ipc.invoke('custom:live:start', { url, qaList, llmConfig });
+                const logBox = modal.querySelector('#live-logs');
+                logBox.innerHTML = '<div style="color:#a6e3a1;">✅ 智能直播监控已启动，正在监听弹幕...</div>';
+                ipc.on('custom:live:msg', (_, data) => {
+                  const item = document.createElement('div');
+                  item.style.cssText = 'padding:8px;background:#181825;border-radius:6px;border-left:3px solid ' + (data.type === 'BLOCKED' ? '#f38ba8' : '#a6e3a1');
+                  item.innerHTML = \`<div><span style="color:#6c7086">[\${data.time}]</span> <strong>观众：</strong>\${data.raw}</div>
+                                    <div style="color:#89b4fa;margin-top:4px;"><strong>🎙 回复：</strong>\${data.reply}</div>\`;
+                  logBox.prepend(item);
+                });
+              }
+            };
+          });
+          </script>
+          `;
+
+          if (fs.existsSync('index.html')) {
+            let html = fs.readFileSync('index.html', 'utf-8');
+            html = html.replace('</body>', uiPanelScript + '\n</body>');
+            fs.writeFileSync('index.html', html, 'utf-8');
+            console.log('✅ 已成功注入前端面板: index.html');
+          }
+
+      - name: 4. 安装依赖
+        run: npm install --legacy-peer-deps
+
+      - name: 5. 编译并打包 Windows .exe
+        run: npm run build:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 6. 上传安装包供下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIGCPanel-Pro-Windows-Installer
+          path: |
+            release/*.exe
+            dist-electron/*.exe
+            out/*.exe
+            dist_electron/*.exe
